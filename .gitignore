@@ -1,0 +1,20 @@
+node_modules/
+dist/
+dist-server/
+coverage/
+dev-dist/
+playwright-report/
+test-results/
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store
+.vite/
+# Secrets and local state — never commit.
+vapid-keys.json
+domino.sqlite
+domino.sqlite-shm
+domino.sqlite-wal
+eng1.b64
+
