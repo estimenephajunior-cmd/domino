@@ -1,16 +1,28 @@
+import { allBoardTiles, openEnds, placeBranch } from './graph.js';
 import seedrandom from 'seedrandom';
-import type { Chain, End, GameState, PlayerState, RuleVariant, Tile } from './types.js';
-import { VARIANT_RULES } from './types.js';
+import type { Chain, End, GameState, PlacedTile, PlayerState, RuleVariant, Tile } from './types.js';
+import { VARIANT_RULES, teamOfSeat } from './types.js';
 
-/** The standard double-six domino set: 28 tiles. */
-export function createDoubleSixSet(): Tile[] {
+/** A complete domino set up to `max` (6 → 28 tiles, 9 → 55 tiles). */
+export function createDominoSet(max: number): Tile[] {
+  if (!Number.isInteger(max) || max < 0 || max > 9) throw new Error('Invalid domino set size');
   const tiles: Tile[] = [];
-  for (let low = 0; low <= 6; low++) {
-    for (let high = low; high <= 6; high++) {
+  for (let low = 0; low <= max; low++) {
+    for (let high = low; high <= max; high++) {
       tiles.push({ id: `${low}-${high}`, low, high });
     }
   }
   return tiles;
+}
+
+/** The standard double-six domino set: 28 tiles. */
+export function createDoubleSixSet(): Tile[] {
+  return createDominoSet(6);
+}
+
+/** The double-nine domino set: 55 tiles (Caribbean / Cuban). */
+export function createDoubleNineSet(): Tile[] {
+  return createDominoSet(9);
 }
 
 /**
@@ -58,6 +70,8 @@ export function handPips(hand: readonly Tile[]): number {
 
 export interface DealResult {
   readonly hands: readonly Tile[][];
+  /** Player ids rotated alongside `hands`, so index 0 is the opening player. */
+  readonly order: readonly string[];
   readonly boneyard: readonly Tile[];
   readonly chain: Chain;
   readonly seed: string;
@@ -72,8 +86,19 @@ export function deal(
   players: readonly { id: string; name: string }[],
   seed: string,
   handSize = 6,
+  setSize: 6 | 9 = 6,
 ): DealResult {
-  const deck = shuffleTiles(createDoubleSixSet(), seed);
+  if (
+    players.length < 1 ||
+    players.length > 4 ||
+    new Set(players.map((p) => p.id)).size !== players.length
+  ) {
+    throw new Error('Expected one to four distinct players');
+  }
+  const deck = shuffleTiles(createDominoSet(setSize), seed);
+  if (!Number.isInteger(handSize) || handSize < 1 || handSize * players.length > deck.length) {
+    throw new Error('Invalid hand size');
+  }
   const hands: Tile[][] = players.map(() => []);
   for (let i = 0; i < handSize * players.length; i++) {
     const tile = deck[i];
@@ -95,8 +120,13 @@ export function deal(
     }
   });
 
-  // Rotate so the opener sits first in the hands array.
+  // Rotate so the opener sits first in the hands array. The id list rotates
+  // with the hands so ownership is preserved: hands[i] still belongs to order[i].
   const rotated = hands.slice(opener).concat(hands.slice(0, opener));
+  const order = players
+    .slice(opener)
+    .concat(players.slice(0, opener))
+    .map((p) => p.id);
 
   // Pick an opening tile: highest double in the opener's hand, else highest pips.
   const openingHand = rotated[0] ?? [];
@@ -118,9 +148,10 @@ export function deal(
 
   // Build the chain from the opening tile (single tile, both ends = tile value).
   const chain: Chain = {
-    tiles: opening ? [opening] : [],
+    tiles: opening ? [{ ...opening, left: opening.low, right: opening.high }] : [],
     leftEnd: opening ? opening.low : 0,
     rightEnd: opening ? opening.high : 0,
+    spinner: null,
   };
 
   // Remove the opening tile from the opener's hand. `rotated[0]` aliases the
@@ -129,7 +160,7 @@ export function deal(
     rotated[0] = (rotated[0] ?? []).filter((t) => t.id !== opening.id);
   }
 
-  return { hands: rotated, boneyard, chain, seed };
+  return { hands: rotated, order, boneyard, chain, seed };
 }
 
 /** A legal placement of one tile on one end of the chain. */
@@ -142,39 +173,25 @@ export interface LegalMove {
  * All legal placements for a hand given the current chain.
  * Respects the variant's double-crossing rule.
  */
-export function legalMoves(
-  hand: readonly Tile[],
-  chain: Chain,
-  variant: RuleVariant,
-): LegalMove[] {
-  const rules = VARIANT_RULES[variant];
+export function legalMoves(hand: readonly Tile[], chain: Chain, variant: RuleVariant): LegalMove[] {
+  if (allBoardTiles(chain).length === 0 && chain.leftEnd === 0 && chain.rightEnd === 0)
+    return hand.map((tile) => ({ tile, end: 'right' }));
   const moves: LegalMove[] = [];
+  const targets = openEnds(chain).filter(
+    (target) =>
+      VARIANT_RULES[variant].doublesCross || target.end === 'left' || target.end === 'right',
+  );
   for (const tile of hand) {
-    const isDouble = tile.low === tile.high;
-    if (tile.low === chain.leftEnd || tile.high === chain.leftEnd) {
-      moves.push({ tile, end: 'left' });
-    }
-    if (tile.low === chain.rightEnd || tile.high === chain.rightEnd) {
-      moves.push({ tile, end: 'right' });
-    }
-    if (isDouble && rules.doublesCross) {
-      if (tile.low === chain.rightEnd && !moves.some((m) => m.end === 'right')) {
-        moves.push({ tile, end: 'right' });
-      }
-      if (tile.low === chain.leftEnd && !moves.some((m) => m.end === 'left')) {
-        moves.push({ tile, end: 'left' });
-      }
+    for (const target of targets) {
+      if (tile.low === target.pip || tile.high === target.pip)
+        moves.push({ tile, end: target.end });
     }
   }
   return moves;
 }
 
 /** True when the player has at least one legal move. */
-export function hasLegalMove(
-  hand: readonly Tile[],
-  chain: Chain,
-  variant: RuleVariant,
-): boolean {
+export function hasLegalMove(hand: readonly Tile[], chain: Chain, variant: RuleVariant): boolean {
   return legalMoves(hand, chain, variant).length > 0;
 }
 
@@ -182,12 +199,7 @@ export function hasLegalMove(
  * Place a tile on one end of the chain, returning the new chain.
  * Throws when the move is illegal so the server can reject it authoritatively.
  */
-export function playTile(
-  chain: Chain,
-  tile: Tile,
-  end: End,
-  variant: RuleVariant,
-): Chain {
+export function playTile(chain: Chain, tile: Tile, end: End, variant: RuleVariant): Chain {
   const allowed = legalMoves([tile], chain, variant);
   if (!allowed.some((m) => m.end === end)) {
     throw new Error(
@@ -195,19 +207,53 @@ export function playTile(
         `(ends are ${chain.leftEnd}|${chain.rightEnd})`,
     );
   }
-  if (end === 'left') {
-    const newLeft = tile.low === chain.leftEnd ? tile.high : tile.low;
+  if (allBoardTiles(chain).some((placed) => placed.id === tile.id)) {
+    throw new Error('Tile is already on the board');
+  }
+  if (
+    chain.tiles.length === 0 &&
+    chain.leftEnd === 0 &&
+    chain.rightEnd === 0 &&
+    !(chain.branches?.top.length || chain.branches?.bottom.length)
+  ) {
+    const placed: PlacedTile = { ...tile, left: tile.low, right: tile.high };
     return {
-      tiles: [...chain.tiles, tile],
-      leftEnd: newLeft,
-      rightEnd: chain.rightEnd,
+      tiles: [placed],
+      leftEnd: tile.low,
+      rightEnd: tile.high,
+      spinner: VARIANT_RULES[variant].doublesCross && tile.low === tile.high ? tile : null,
     };
   }
-  const newRight = tile.high === chain.rightEnd ? tile.low : tile.high;
+  if (end === 'top' || end === 'bottom') return placeBranch(chain, tile, end);
+  const rules = VARIANT_RULES[variant];
+  // First double placed in a doubles-cross variant becomes the spinner.
+  const spinner = chain.spinner ?? (rules.doublesCross && tile.low === tile.high ? tile : null);
+  if (end === 'left') {
+    // The matching half touches the chain, so it faces RIGHT on the board;
+    // the exposed half faces LEFT and becomes the new open end.
+    const matchesLow = tile.low === chain.leftEnd;
+    const right = matchesLow ? tile.low : tile.high;
+    const left = matchesLow ? tile.high : tile.low;
+    const placed: PlacedTile = { ...tile, left, right };
+    return {
+      ...chain,
+      tiles: [placed, ...chain.tiles],
+      leftEnd: left,
+      rightEnd: chain.rightEnd,
+      spinner,
+    };
+  }
+  // Mirrored for the right end: the matching half faces LEFT.
+  const matchesHigh = tile.high === chain.rightEnd;
+  const left = matchesHigh ? tile.high : tile.low;
+  const right = matchesHigh ? tile.low : tile.high;
+  const placed: PlacedTile = { ...tile, left, right };
   return {
-    tiles: [...chain.tiles, tile],
+    ...chain,
+    tiles: [...chain.tiles, placed],
     leftEnd: chain.leftEnd,
-    rightEnd: newRight,
+    rightEnd: right,
+    spinner,
   };
 }
 
@@ -229,20 +275,33 @@ export function scoreHand(
   const rules = VARIANT_RULES[variant];
   const deltas: Record<string, number> = {};
   for (const p of players) deltas[p.id] = 0;
-  const winner = players.find((p) => p.id === winnerId);
-  if (!winner) return deltas;
+  const winnerIndex = players.findIndex((p) => p.id === winnerId);
+  const winner = players[winnerIndex];
+  if (winnerIndex === -1 || !winner) return deltas;
+
+  // Partnership variants settle per team (seats 0,2 vs 1,3): the winning
+  // team collects the losing team's total, credited equally to both partners.
+  const scoringSeats = rules.partnership
+    ? players
+        .map((p, i) => ({ p, i }))
+        .filter(({ i }) => teamOfSeat(i) === teamOfSeat(winnerIndex))
+        .map(({ p }) => p)
+    : [winner];
 
   if (!rules.pipScoring) {
-    deltas[winnerId] = 1;
+    for (const p of scoringSeats) deltas[p.id] = 1;
     return deltas;
   }
 
+  const winningIds = new Set(scoringSeats.map((p) => p.id));
   let loserTotal = 0;
   for (const p of players) {
-    if (p.id === winnerId) continue;
+    if (winningIds.has(p.id)) continue;
     loserTotal += handPips(p.hand);
   }
-  deltas[winnerId] = Math.round(loserTotal * rules.scoreMultiplier);
+  const total = loserTotal * rules.scoreMultiplier;
+  const award = variant === 'all-fives' ? Math.round(total / 5) * 5 : Math.round(total);
+  for (const p of scoringSeats) deltas[p.id] = award;
   return deltas;
 }
 
@@ -251,27 +310,57 @@ export function createInitialState(
   players: readonly { id: string; name: string }[],
   variant: RuleVariant,
   seed: string,
-  handSize = 6,
+  _handSize = 6,
 ): GameState {
-  const dealt = deal(players, seed, handSize);
-  const playerStates: PlayerState[] = dealt.hands.map((hand, i) => ({
-    id: players[i]?.id ?? '',
-    name: players[i]?.name ?? `Player ${i + 1}`,
-    hand,
+  const rules = VARIANT_RULES[variant];
+  const deck = shuffleTiles(createDominoSet(rules.setSize), seed);
+  if (
+    players.length < 1 ||
+    players.length > 4 ||
+    new Set(players.map((player) => player.id)).size !== players.length ||
+    !Number.isInteger(_handSize) ||
+    _handSize < 1 ||
+    _handSize * players.length > deck.length
+  )
+    throw new Error('Invalid physical deal');
+  const playerStates: PlayerState[] = players.map((p) => ({
+    id: p.id,
+    name: p.name,
+    hand: [],
     score: 0,
     seated: true,
   }));
   return {
     players: playerStates,
-    chain: dealt.chain,
-    boneyard: dealt.boneyard,
-    phase: 'awaiting-play',
-    currentPlayer: playerStates[0]?.id ?? '',
+    chain: { tiles: [], leftEnd: 0, rightEnd: 0, spinner: null },
+    boneyard: [],
+    phase: 'mixing',
+    currentPlayer: players[0]?.id ?? '',
     turn: 0,
     variant,
     winner: null,
     lastMove: null,
     seed,
+    dealerId: players[0]?.id ?? '',
+    currentPickerId: null,
+    mixingEndsAt: null,
+    dealSlots: deck.map((tile, index) => ({ id: `slot-${index}`, tile, claimedBy: null })),
+    preferredStarterId: null,
   };
 }
 
+/** Holder of the highest double, falling back to the highest-pip tile. */
+export function openingPlayer(players: readonly PlayerState[]): string {
+  let owner = players[0]?.id ?? '';
+  let best = -1;
+  for (const player of players) {
+    for (const tile of player.hand) {
+      const rank = tile.low === tile.high ? 100 + tile.low : tilePips(tile);
+      if (rank > best) {
+        best = rank;
+        owner = player.id;
+      }
+    }
+  }
+  return owner;
+}

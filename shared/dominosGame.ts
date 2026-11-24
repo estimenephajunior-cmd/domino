@@ -1,37 +1,56 @@
-import { INVALID_MOVE, TurnOrder } from 'boardgame.io/core';
+import type { MutatorConfig } from './phaseFive.js';
+import { timeoutMove } from './speed.js';
+import { INVALID_MOVE } from 'boardgame.io/dist/cjs/core.js';
 import type { Game } from 'boardgame.io';
+import { legalMoves } from './engine.js';
 import {
-  createInitialState,
-  drawFromBoneyard,
-  hasLegalMove,
-  legalMoves,
-  playTile,
-  scoreHand,
-} from './engine.js';
-import type { End, GameState, RuleVariant, Tile } from './types.js';
+  createTableState,
+  drawTileMove,
+  mixTilesMove,
+  finishMixingMove,
+  nextPlayerId,
+  passMove,
+  pickTileMove,
+  playTileMove,
+  startNextHand,
+} from './moves.js';
+import type { End, GameState, PublicGameAction, RuleVariant, Tile } from './types.js';
 
 /**
  * boardgame.io game definition for the Domino Engine.
  * Acts as the authoritative turn-based state machine: phase management,
  * turn advancement, legal-move validation and deterministic undo history.
+ *
+ * All rule logic lives in `shared/moves.ts`; this module only adapts those
+ * pure functions to boardgame.io's (G, playerID) move contract so the server,
+ * tests and the local table controller share one implementation.
  */
 
 export interface DominosState extends GameState {
+  readonly mutators?: MutatorConfig;
   /** Move log for the replay recorder. */
   readonly history: readonly { playerId: string; tileId: string; end: End }[];
   readonly handNumber: number;
+  /** Hand size for the deal; carried across hands for `startNextHand`. */
+  readonly handSize: number;
   /** Set when the current player is blocked with no boneyard to draw from. */
   readonly blocked: boolean;
+  /** True while the current player must keep drawing (no playable tile yet). */
+  readonly drawing: boolean;
+  /** Consecutive passes among active seats; a full rotation blocks the hand. */
+  readonly passStreak: number;
+  readonly publicActions?: readonly PublicGameAction[];
 }
 
 export interface DominosSetupData {
+  readonly mutators?: MutatorConfig;
   readonly variant: RuleVariant;
   readonly seed: string;
   readonly handSize: number;
   readonly players: readonly { id: string; name: string }[];
 }
 
-export const DominosGame: Game<DominosState, Record<string, never>, DominosSetupData> = {
+export const DominosGame: Game<DominosState, Record<string, unknown>, DominosSetupData> = {
   name: 'domino',
 
   setup: (_context, setupData) => {
@@ -39,18 +58,29 @@ export const DominosGame: Game<DominosState, Record<string, never>, DominosSetup
       variant: 'block' as RuleVariant,
       seed: 'domino-seed',
       handSize: 6,
-      players: [{ id: '0', name: 'Player 1' }],
+      players: [{ id: '0', name: 'Domino' }],
     };
-    const base = createInitialState(data.players, data.variant, data.seed, data.handSize);
-    return {
-      ...base,
-      history: [],
-      handNumber: 1,
-      blocked: false,
-    };
+    return createTableState(data.players, data.variant, data.seed, data.handSize, data.mutators);
   },
 
   moves: {
+    mixTiles: ({ G, playerID }, now: number) => {
+      if (!playerID) return INVALID_MOVE;
+      const outcome = mixTilesMove(G, playerID, now);
+      return outcome.ok ? outcome.state : INVALID_MOVE;
+    },
+    finishMixing: ({ G }, now: number) => {
+      const outcome = finishMixingMove(G, now);
+      if (!outcome.ok) return INVALID_MOVE;
+      return outcome.state;
+    },
+
+    pickTile: ({ G, playerID }, slotId: string, now: number) => {
+      if (!playerID) return INVALID_MOVE;
+      const outcome = pickTileMove(G, playerID, slotId, now);
+      return outcome.ok ? outcome.state : INVALID_MOVE;
+    },
+
     /**
      * Play a tile on one end of the chain.
      * The move is rejected (INVALID_MOVE) when it is not the player's turn
@@ -58,134 +88,80 @@ export const DominosGame: Game<DominosState, Record<string, never>, DominosSetup
      */
     playTile: ({ G, playerID }, tileId: string, end: End) => {
       if (playerID === null || playerID === undefined) return INVALID_MOVE;
-      if (G.phase !== 'awaiting-play') return INVALID_MOVE;
-
-      const idx = G.players.findIndex((p) => p.id === playerID);
-      const player = G.players[idx];
-      if (!player) return INVALID_MOVE;
-      if (G.currentPlayer !== playerID) return INVALID_MOVE;
-
-      const tile = player.hand.find((t) => t.id === tileId);
-      if (!tile) return INVALID_MOVE;
-
-      const allowed = legalMoves(player.hand, G.chain, G.variant);
-      if (!allowed.some((m) => m.tile.id === tileId && m.end === end)) {
-        return INVALID_MOVE;
-      }
-
-      const chain = playTile(G.chain, tile, end, G.variant);
-      const hand = player.hand.filter((t) => t.id !== tileId);
-      const players = [...G.players];
-      players[idx] = { ...player, hand };
-
-      const wentOut = hand.length === 0;
-      if (wentOut) {
-        const deltas = scoreHand(players, playerID, G.variant);
-        const scored = players.map((p) => ({
-          ...p,
-          score: p.score + (deltas[p.id] ?? 0),
-        }));
-        return {
-          ...G,
-          players: scored,
-          chain,
-          phase: 'hand-complete' as const,
-          winner: playerID,
-          lastMove: { playerId: playerID, tile, end },
-          history: [...G.history, { playerId: playerID, tileId, end }],
-        };
-      }
-
-      return {
-        ...G,
-        players,
-        chain,
-        phase: 'awaiting-play' as const,
-        turn: G.turn + 1,
-        lastMove: { playerId: playerID, tile, end },
-        history: [...G.history, { playerId: playerID, tileId, end }],
-        blocked: false,
-      };
+      const outcome = playTileMove(G, playerID, tileId, end);
+      return outcome.ok
+        ? advance(
+            outcome.state,
+            G.mutators?.wildDouble === true &&
+              outcome.state.lastMove?.tile.low === outcome.state.lastMove?.tile.high,
+          )
+        : INVALID_MOVE;
     },
 
     /**
      * Draw a tile from the boneyard. Only legal when the player has no
-     * playable tile and the variant permits drawing.
+     * playable tile; the drawer keeps their turn until a drawn tile becomes
+     * playable or the boneyard runs dry (classic draw-until-playable rule).
      */
     drawTile: ({ G, playerID }) => {
       if (playerID === null || playerID === undefined) return INVALID_MOVE;
-      if (G.phase !== 'awaiting-play') return INVALID_MOVE;
-      if (G.currentPlayer !== playerID) return INVALID_MOVE;
-
-      const idx = G.players.findIndex((p) => p.id === playerID);
-      const player = G.players[idx];
-      if (!player) return INVALID_MOVE;
-      if (hasLegalMove(player.hand, G.chain, G.variant)) return INVALID_MOVE;
-
-      const drawn = drawFromBoneyard(G.boneyard);
-      if (!drawn) return INVALID_MOVE;
-
-      const players = [...G.players];
-      players[idx] = { ...player, hand: [...player.hand, drawn] };
-      return {
-        ...G,
-        players,
-        boneyard: G.boneyard.slice(1),
-        phase: 'awaiting-play' as const,
-        turn: G.turn + 1,
-        blocked: false,
-      };
+      const outcome = drawTileMove(G, playerID);
+      return outcome.ok ? outcome.state : INVALID_MOVE;
     },
 
     /** Pass the turn when a player is blocked and cannot draw. */
     pass: ({ G, playerID }) => {
       if (playerID === null || playerID === undefined) return INVALID_MOVE;
-      if (G.currentPlayer !== playerID) return INVALID_MOVE;
-      const me = G.players.find((p) => p.id === playerID);
-      if (hasLegalMove(me?.hand ?? [], G.chain, G.variant)) return INVALID_MOVE;
-      return { ...G, blocked: true, turn: G.turn + 1 };
+      const outcome = passMove(G, playerID);
+      return outcome.ok ? advance(outcome.state) : INVALID_MOVE;
+    },
+
+    timeout: ({ G, playerID }) => {
+      if (!playerID || !G.mutators?.speed) return INVALID_MOVE;
+      const outcome = timeoutMove(G, playerID);
+      return outcome.ok ? advance(outcome.state) : INVALID_MOVE;
+    },
+
+    /** Deal the next hand once the current one has finished. */
+    nextHand: ({ G, playerID }, seed?: string) => {
+      if (playerID === null || playerID === undefined) return INVALID_MOVE;
+      const outcome = startNextHand(G, seed);
+      return outcome.ok ? outcome.state : INVALID_MOVE;
     },
   },
 
+  // All seats may request the next hand; pure moves enforce actual turn ownership.
   turn: {
-    order: TurnOrder.DEFAULT,
-    // Skip seats that have already gone out, so the turn never lands on an
-    // empty hand. Returning `{ next }` lets boardgame.io jump directly to
-    // the next player who still holds tiles.
-    endIf: ({ G }) => {
-      if (G.phase === 'hand-complete') return false;
-      const next = nextPlayerId(G);
-      if (next === null) return false;
-      return { next };
+    activePlayers: { all: 'play' },
+    stages: { play: {} },
+    order: {
+      playOrder: ({ G }) => G.players.map((p) => p.id),
+      first: ({ G }) => G.players.findIndex((p) => p.id === G.currentPlayer),
+      next: ({ G }) => G.players.findIndex((p) => p.id === G.currentPlayer),
     },
+    endIf: ({ G, ctx }) => G.currentPlayer !== ctx.currentPlayer,
   },
-
-  endIf: ({ G }) => (G.phase === 'hand-complete' ? G.winner : undefined),
+  // A hand ending is not the end of the multi-hand match.
+  playerView: ({ G, playerID }) => ({
+    ...G,
+    seed: '',
+    boneyard: [],
+    players: G.players.map((p) => ({ ...p, hand: p.id === playerID ? p.hand : [] })),
+  }),
 };
 
-/**
- * Id of the next player who still holds tiles, or null when the hand is over.
- * Scans forward from the current player in seating order.
- */
-export function nextPlayerId(G: DominosState): string | null {
-  const count = G.players.length;
-  if (count === 0) return null;
-  const current = G.players.findIndex((p) => p.id === G.currentPlayer);
-  const base = current === -1 ? 0 : current;
-  for (let step = 1; step <= count; step++) {
-    const idx = (base + step) % count;
-    const player = G.players[idx];
-    if (player && player.hand.length > 0) return player.id;
-  }
-  return null;
-}
+export { nextPlayerId };
 
-/** Convenience helper used by tests and the AI predictor. */
-export function playableTiles(
-  G: DominosState,
-  playerId: string,
-): { tile: Tile; end: End }[] {
+/**
+ * Convenience helper used by tests and the AI predictor.
+ */
+export function playableTiles(G: DominosState, playerId: string): { tile: Tile; end: End }[] {
   const player = G.players.find((p) => p.id === playerId);
   if (!player) return [];
   return legalMoves(player.hand, G.chain, G.variant);
+}
+
+function advance(state: DominosState, extraTurn = false): DominosState {
+  if (state.phase !== 'awaiting-play' || extraTurn) return state;
+  return { ...state, currentPlayer: nextPlayerId(state) ?? state.currentPlayer };
 }

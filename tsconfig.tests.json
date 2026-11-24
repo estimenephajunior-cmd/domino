@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.server.json",
+  "compilerOptions": { "noEmit": true, "lib": ["ES2023", "DOM"] },
+  "include": [
+    "tests/integration",
+    "tests/e2e",
+    "server/web-push.d.ts",
+    "shared/*.d.ts"
+  ],
+  "exclude": ["node_modules", "dist", "dist-server"]
+}

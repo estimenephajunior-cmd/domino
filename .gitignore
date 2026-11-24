@@ -16,5 +16,8 @@ vapid-keys.json
 domino.sqlite
 domino.sqlite-shm
 domino.sqlite-wal
+e2e-domino.sqlite
+e2e-domino.sqlite-shm
+e2e-domino.sqlite-wal
 eng1.b64
 

@@ -4,16 +4,19 @@ import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import { VitePWA } from 'vite-plugin-pwa';
 import path from 'node:path';
+import { voiceAssets } from './voiceAssets';
 
 export default defineConfig({
   plugins: [
     react(),
     tailwindcss(),
+    voiceAssets(),
     VitePWA({
       registerType: 'autoUpdate',
       includeAssets: ['favicon.svg'],
       workbox: {
         globPatterns: ['**/*.{js,css,html,svg,png,woff2}'],
+        globIgnores: ['voice/**', '**/voice-inference*'],
         maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
         cleanupOutdatedCaches: true,
       },
@@ -60,6 +63,10 @@ export default defineConfig({
         // codeSplitting.groups is the declarative replacement.
         codeSplitting: {
           groups: [
+            {
+              name: 'voice-inference',
+              test: /node_modules[\\/](onnxruntime-web|onnxruntime-common|@ricky0123)[\\/]/,
+            },
             { name: 'react', test: /node_modules[\\/](react|react-dom|scheduler)[\\/]/ },
             { name: 'pixi', test: /node_modules[\\/]pixi\.js[\\/]/ },
             { name: 'physics', test: /node_modules[\\/]matter-js[\\/]/ },
